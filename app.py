@@ -8,33 +8,65 @@ import json
 import os
 import matplotlib.pyplot as plt
 import tensorflow as tf
+import pandas as pd
+import zipfile
+from pathlib import Path
+from tqdm import tqdm
+import tempfile
 
-st.set_page_config(page_title="Cat vs Dog - Demo", page_icon="🐱🐶", layout="centered")
+# ---------------------------
+# Config halaman & theme UI
+# ---------------------------
+st.set_page_config(page_title="Cat vs Dog - Pro App", page_icon="🐱🐶", layout="wide")
+# Minimal style polish
+st.markdown(
+    """
+<style>
+.header { font-size:28px; font-weight:700; }
+.small-desc { color: #666; font-size:14px; }
+.card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-# -----------------------
-# CONFIG / HUGGINGFACE URLS
-# -----------------------
+# ---------------------------
+# Constants - Hugging Face links
+# ---------------------------
 MODEL_URL = "https://huggingface.co/alifia1/catvsdog/resolve/main/model_mobilenetv2.keras"
 CLASS_INDICES_URL = "https://huggingface.co/alifia1/catvsdog/resolve/main/class_indices.json"
 
-# Local cache paths
 MODEL_CACHE_DIR = "models_cache"
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 MODEL_LOCAL_PATH = os.path.join(MODEL_CACHE_DIR, "model_mobilenetv2.keras")
 CLASS_LOCAL_PATH = os.path.join(MODEL_CACHE_DIR, "class_indices.json")
 
-# -----------------------
-# UTIL: download helper
-# -----------------------
+IMG_SIZE = 128
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def get_hf_headers():
+    # Support Hugging Face private repos via HF token in env var HF_TOKEN or Streamlit secrets
+    token = None
+    # Prefer st.secrets if available (Streamlit Cloud)
+    try:
+        token = st.secrets.get("HF_TOKEN")
+    except Exception:
+        token = None
+    if not token:
+        token = os.environ.get("HF_TOKEN")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
 def download_file(url, local_path, desc=None):
-    """
-    Download url to local_path if not exist. Return local_path.
-    """
     if os.path.exists(local_path):
         return local_path
+    headers = get_hf_headers()
     try:
         with st.spinner(f"Downloading {desc or 'file'} from remote..."):
-            resp = requests.get(url, stream=True, timeout=60)
+            resp = requests.get(url, stream=True, headers=headers, timeout=60)
             resp.raise_for_status()
             with open(local_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
@@ -42,7 +74,6 @@ def download_file(url, local_path, desc=None):
                         f.write(chunk)
         return local_path
     except Exception as e:
-        # if download failed, remove possibly partial file
         if os.path.exists(local_path):
             try:
                 os.remove(local_path)
@@ -50,206 +81,276 @@ def download_file(url, local_path, desc=None):
                 pass
         raise RuntimeError(f"Download failed for {url}: {e}")
 
-# -----------------------
-# CACHE: load model & classes
-# -----------------------
 @st.cache_resource(show_spinner=False)
-def load_model_and_classes(model_url=MODEL_URL, class_url=CLASS_INDICES_URL):
-    # 1) download model file (if needed)
+def load_model_and_classes():
+    # download model and class json (if public) or use local copy if provided manually
     try:
-        model_path = download_file(model_url, MODEL_LOCAL_PATH, desc="model")
+        model_path = download_file(MODEL_URL, MODEL_LOCAL_PATH, desc="model")
     except Exception as e:
         raise RuntimeError(f"Could not download model: {e}")
-
-    # 2) load keras model
     try:
         model = tf.keras.models.load_model(model_path)
     except Exception as e:
         raise RuntimeError(f"Failed to load model from {model_path}: {e}")
 
-    # 3) download class indices json
+    # classes
+    labels_map = {0: "Cat", 1: "Dog"}  # fallback
     try:
-        class_path = download_file(class_url, CLASS_LOCAL_PATH, desc="class indices")
-    except Exception as e:
-        # continue but warn
-        st.warning(f"Gagal mengunduh class_indices.json: {e}. Akan coba baca lokal jika ada.")
-        class_path = CLASS_LOCAL_PATH
-
-    # 4) load class mapping
-    labels_map = None
-    if os.path.exists(class_path):
-        try:
-            with open(class_path, "r") as f:
-                class_json = json.load(f)
-            # class_json expected like {"Cat":0,"Dog":1} or {"0":"Cat","1":"Dog"}
-            # Normalize to index->label map
-            if all(isinstance(v, int) for v in class_json.values()):
-                # name->index mapping -> invert
-                labels_map = {int(v): k for k, v in class_json.items()}
-            else:
-                # maybe index->name already
-                labels_map = {int(k): v for k, v in class_json.items()}
-        except Exception as e:
-            st.warning(f"Gagal membaca class_indices.json: {e}")
-            labels_map = {0: "Cat", 1: "Dog"}  # fallback
-    else:
-        labels_map = {0: "Cat", 1: "Dog"}  # fallback
+        class_path = download_file(CLASS_INDICES_URL, CLASS_LOCAL_PATH, desc="class indices")
+        with open(class_path, "r") as f:
+            class_json = json.load(f)
+        if all(isinstance(v, int) for v in class_json.values()):
+            labels_map = {int(v): k for k, v in class_json.items()}
+        else:
+            labels_map = {int(k): v for k, v in class_json.items()}
+    except Exception:
+        # ignore - fallback used
+        pass
 
     return model, labels_map
 
-# Try loading model (on startup)
+def preprocess_pil(img: Image.Image, target_size=(IMG_SIZE, IMG_SIZE)):
+    img_resized = img.resize(target_size)
+    arr = np.asarray(img_resized).astype("float32") / 255.0
+    if arr.ndim == 2:
+        arr = np.stack([arr]*3, axis=-1)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    arr = np.expand_dims(arr, axis=0)
+    return arr
+
+def predict_image(model, img_pil):
+    X = preprocess_pil(img_pil)
+    pred = model.predict(X)
+    prob = float(pred.flatten()[0])
+    label_idx = 1 if prob > 0.5 else 0
+    return label_idx, prob
+
+def extract_zip_to_temp(zip_bytes):
+    tmpdir = tempfile.mkdtemp()
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        z.extractall(tmpdir)
+    return tmpdir
+
+# ---------------------------
+# Load model (cached)
+# ---------------------------
 try:
     model, labels_map = load_model_and_classes()
 except Exception as e:
-    st.error(f"Error saat memuat model atau class indices: {e}")
+    st.error("Error memuat model — lihat pesan berikut:")
+    st.exception(e)
     st.stop()
 
-# -----------------------
-# APP UI
-# -----------------------
-st.title("Cat vs Dog Classifier")
-st.markdown(
-    """
-Aplikasi ini menggunakan **MobileNetV2 (pretrained)** yang sudah di-fine-tune untuk membedakan kucing dan anjing.  
-Model dan class mapping disimpan di Hugging Face.  
-**Preprocessing** mengikuti pipeline training: resize ke **128×128**, ubah ke array, dan normalisasi `pixel / 255.0`.
-"""
-)
-
-with st.expander("Cara kerja singkat (untuk catatan)"):
-    st.write(
-        """
-- Masukkan gambar (upload atau URL) berformat JPG/PNG.
-- Gambar diresize ke 128×128 dan distandarisasi (/255).
-- Model menghasilkan probabilitas, threshold 0.5 -> Dog, <0.5 -> Cat.
-- Model diunduh sekali dan disimpan secara lokal di folder `models_cache/`.
-"""
-    )
-
-st.sidebar.header("Pengaturan & Info")
-st.sidebar.write("Model: MobileNetV2 (fine-tuned)\nTarget image size: 128x128")
-st.sidebar.write("Model source: Hugging Face (downloaded)")
-
-# -----------------------
-# Input: image via upload or URL or sample
-# -----------------------
-input_mode = st.radio("Pilih sumber gambar:", ("Upload file", "Image URL", "Contoh sample"))
-
-image_bytes = None
-image_pil = None
-
-if input_mode == "Upload file":
-    uploaded_file = st.file_uploader("Upload file gambar (JPG/PNG)", type=["jpg", "jpeg", "png"])
-    if uploaded_file is not None:
+# ---------------------------
+# Layout - Sidebar
+# ---------------------------
+with st.sidebar:
+    st.header("Settings")
+    st.write("Model: MobileNetV2 (fine-tuned)")
+    st.write(f"Input size: {IMG_SIZE}×{IMG_SIZE}")
+    st.markdown("---")
+    st.subheader("Hugging Face Token (opsional)")
+    st.info("Untuk repo privat: simpan HF token sebagai `HF_TOKEN` di Secrets (Streamlit) atau env var.")
+    if "HF_TOKEN" in os.environ:
+        st.success("HF_TOKEN ditemukan di environment.")
+    st.markdown("---")
+    st.subheader("Quick actions")
+    if st.button("Clear cached model"):
+        # clear cache by deleting file + resetting cache resource
         try:
-            image_bytes = uploaded_file.read()
-            image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            if os.path.exists(MODEL_LOCAL_PATH):
+                os.remove(MODEL_LOCAL_PATH)
+            if os.path.exists(CLASS_LOCAL_PATH):
+                os.remove(CLASS_LOCAL_PATH)
+            st.cache_resource.clear()
+            st.success("Cache model dihapus. Reload aplikasi.")
         except Exception as e:
-            st.error(f"Gagal membaca file: {e}")
+            st.error(f"Gagal menghapus cache: {e}")
 
-elif input_mode == "Image URL":
-    img_url = st.text_input("Masukkan URL gambar (public):")
-    if img_url:
-        try:
-            with st.spinner("Mengunduh gambar..."):
-                resp = requests.get(img_url, timeout=30)
+st.title("Cat vs Dog — Professional Streamlit App")
+st.markdown('<div class="small-desc">Upload gambar tunggal / multiple / zip, lihat preview, lakukan prediksi batch & download hasil CSV.</div>', unsafe_allow_html=True)
+st.markdown("---")
+
+# ---------------------------
+# Main columns: left (controls) right (results)
+# ---------------------------
+left, right = st.columns([1, 1.3])
+
+with left:
+    st.subheader("Input gambar")
+    input_mode = st.radio("Pilih mode input:", ["Single upload", "Multiple files", "Upload ZIP", "Image URL", "Sample gallery"])
+
+    uploaded_files = []
+    zip_tmpdir = None
+    single_image = None
+
+    if input_mode == "Single upload":
+        f = st.file_uploader("Upload 1 gambar (jpg/png)", type=["jpg", "jpeg", "png"], key="single")
+        if f:
+            try:
+                single_image = Image.open(f).convert("RGB")
+            except Exception as e:
+                st.error(f"Gagal membaca file: {e}")
+
+    elif input_mode == "Multiple files":
+        uploaded_files = st.file_uploader("Upload beberapa gambar (Ctrl+click) (jpg/png)", type=["jpg","jpeg","png"], accept_multiple_files=True, key="multi")
+        if uploaded_files:
+            st.info(f"{len(uploaded_files)} file ter-upload")
+
+    elif input_mode == "Upload ZIP":
+        z = st.file_uploader("Upload ZIP berisi gambar (jpg/png)", type=["zip"], key="zip")
+        if z:
+            try:
+                zip_bytes = z.read()
+                zip_tmpdir = extract_zip_to_temp(zip_bytes)
+                st.success(f"ZIP diekstrak ke: {zip_tmpdir}")
+            except Exception as e:
+                st.error(f"Gagal ekstrak ZIP: {e}")
+
+    elif input_mode == "Image URL":
+        img_url = st.text_input("Masukkan URL gambar publik:")
+        if img_url:
+            try:
+                resp = requests.get(img_url, timeout=20)
                 resp.raise_for_status()
-                image_bytes = resp.content
-                image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception as e:
-            st.error(f"Gagal mengunduh atau membaca gambar dari URL: {e}")
+                single_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            except Exception as e:
+                st.error(f"Gagal ambil gambar dari URL: {e}")
 
-else:  # sample
-    st.write("Gunakan contoh dari dataset publik atau upload sendiri.")
-    sample_col1, sample_col2 = st.columns(2)
-    with sample_col1:
-        sample_cat = st.button("Contoh: Kucing (sample online)")
-    with sample_col2:
-        sample_dog = st.button("Contoh: Anjing (sample online)")
-
-    if sample_cat:
-        # small public sample image; if not accessible, user can upload
-        sample_link = "https://raw.githubusercontent.com/mdavids1990/cats-vs-dogs-samples/main/cat.jpg"
-        try:
-            resp = requests.get(sample_link, timeout=20)
-            resp.raise_for_status()
-            image_bytes = resp.content
-            image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception as e:
-            st.warning("Tidak dapat mengambil sample; silakan upload manual.")
-    if sample_dog:
-        sample_link = "https://raw.githubusercontent.com/mdavids1990/cats-vs-dogs-samples/main/dog.jpg"
-        try:
-            resp = requests.get(sample_link, timeout=20)
-            resp.raise_for_status()
-            image_bytes = resp.content
-            image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception as e:
-            st.warning("Tidak dapat mengambil sample; silakan upload manual.")
-
-# Show image preview
-if image_pil is not None:
-    st.subheader("Preview Gambar")
-    st.image(image_pil, use_column_width=True)
-
-    # Preprocess
-    IMG_SIZE = 128
-    def preprocess_pil(img: Image.Image, target_size=(IMG_SIZE, IMG_SIZE)):
-        img_resized = img.resize(target_size)
-        arr = np.asarray(img_resized).astype("float32") / 255.0
-        if arr.ndim == 2:  # grayscale -> to RGB
-            arr = np.stack([arr]*3, axis=-1)
-        if arr.shape[-1] == 4:  # RGBA -> RGB
-            arr = arr[..., :3]
-        arr = np.expand_dims(arr, axis=0)
-        return arr
-
-    X = preprocess_pil(image_pil)
-
-    # Predict
-    with st.spinner("Melakukan prediksi..."):
-        try:
-            pred = model.predict(X)
-            # pred shape could be (1,1) or (1,) depending on model
-            prob = float(pred.flatten()[0])
-            # since training uses sigmoid binary classification:
-            label_idx = 1 if prob > 0.5 else 0
-            label_name = labels_map.get(label_idx, str(label_idx))
-            confidence = prob if label_idx == 1 else 1 - prob  # confidence for predicted class
-        except Exception as e:
-            st.error(f"Gagal prediksi: {e}")
-            st.stop()
-
-    # Display results
-    st.markdown("### Hasil Prediksi")
-    st.write(f"**Prediksi:** `{label_name}`")
-    st.write(f"**Probabilitas (as Dog probability):** {prob:.4f}")
-    st.write(f"**Confidence pada kelas terpilih:** {confidence:.4f}")
-
-    # Probability bar
-    fig, ax = plt.subplots(figsize=(6,1.2))
-    ax.barh([0], [prob], height=0.5)
-    ax.set_xlim(0,1)
-    ax.set_xlabel("Probabilitas (Dog)")
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    st.pyplot(fig)
-
-    st.success(f"Label: {label_name} (confidence {confidence:.2%})")
+    else:  # Sample gallery
+        st.write("Pilih contoh gambar untuk testing cepat")
+        col1, col2, col3 = st.columns(3)
+        sample_urls = [
+            ("Cat 1", "https://raw.githubusercontent.com/mdavids1990/cats-vs-dogs-samples/main/cat.jpg"),
+            ("Dog 1", "https://raw.githubusercontent.com/mdavids1990/cats-vs-dogs-samples/main/dog.jpg"),
+            # add more public sample links if desired
+        ]
+        with col1:
+            if st.button("Sample: Cat"):
+                try:
+                    resp = requests.get(sample_urls[0][1], timeout=20); resp.raise_for_status()
+                    single_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                except Exception as e:
+                    st.warning("Gagal ambil sample.")
+        with col2:
+            if st.button("Sample: Dog"):
+                try:
+                    resp = requests.get(sample_urls[1][1], timeout=20); resp.raise_for_status()
+                    single_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                except Exception as e:
+                    st.warning("Gagal ambil sample.")
 
     st.markdown("---")
-    st.caption("Notes: Model threshold 0.5. Jika model dilatih berbeda, threshold sebaiknya disesuaikan.")
+    st.subheader("Options")
+    thresh = st.slider("Threshold (0.0 - 1.0) untuk klasifikasi Dog", 0.0, 1.0, 0.5, 0.01)
+    show_prob_plot = st.checkbox("Tampilkan bar probabilitas", True)
+    run_button = st.button("Run Prediction", type="primary")
 
-else:
-    st.info("Belum ada gambar. Upload file atau masukkan URL gambar untuk mulai prediksi.")
+with right:
+    st.subheader("Preview & Results")
+    results = []  # list of dicts: {filename, label, prob}
 
-# -----------------------
-# Footer / Usage
-# -----------------------
+    # Prepare list of image sources depending on selected input mode
+    imgs_for_pred = []  # tuples (name, PIL.Image)
+    if single_image:
+        imgs_for_pred.append(("uploaded_image", single_image))
+    if uploaded_files:
+        for up in uploaded_files:
+            try:
+                pil = Image.open(up).convert("RGB")
+                imgs_for_pred.append((up.name, pil))
+            except Exception as e:
+                st.warning(f"Gagal baca {up.name}: {e}")
+    if zip_tmpdir:
+        # find images in extracted folder
+        p = Path(zip_tmpdir)
+        image_paths = list(p.rglob("*"))
+        image_paths = [p for p in image_paths if p.suffix.lower() in [".jpg",".jpeg",".png"]]
+        st.info(f"{len(image_paths)} gambar ditemukan di ZIP")
+        for ip in image_paths:
+            try:
+                pil = Image.open(ip).convert("RGB")
+                imgs_for_pred.append((ip.name, pil))
+            except Exception as e:
+                st.warning(f"Gagal baca {ip}: {e}")
+
+    # Show thumbnails
+    if imgs_for_pred:
+        cols = st.columns(3)
+        for i, (name, pil) in enumerate(imgs_for_pred):
+            with cols[i % 3]:
+                st.image(pil.resize((160,160)), caption=str(name), use_column_width=False)
+
+    if run_button:
+        if not imgs_for_pred:
+            st.warning("Belum ada gambar untuk diprediksi. Upload atau pilih sample dulu.")
+        else:
+            progress_bar = st.progress(0)
+            total = len(imgs_for_pred)
+            for idx, (name, pil) in enumerate(imgs_for_pred):
+                try:
+                    label_idx, prob = predict_image(model, pil)
+                    # use user threshold for deciding label
+                    pred_label_idx = 1 if prob >= thresh else 0
+                    pred_label = labels_map.get(pred_label_idx, str(pred_label_idx))
+                    confidence = prob if pred_label_idx == 1 else 1 - prob
+                    results.append({
+                        "filename": str(name),
+                        "pred_label": pred_label,
+                        "prob_dog": float(prob),
+                        "confidence": float(confidence)
+                    })
+                except Exception as e:
+                    results.append({
+                        "filename": str(name),
+                        "pred_label": "ERROR",
+                        "prob_dog": None,
+                        "confidence": None,
+                        "error": str(e)
+                    })
+                progress_bar.progress((idx+1)/total)
+            st.success("Selesai prediksi batch ✅")
+
+            # Display results table
+            df_res = pd.DataFrame(results)
+            st.dataframe(df_res)
+
+            # Probability bar visualization per image
+            if show_prob_plot:
+                st.markdown("#### Probabilities (Dog score)")
+                fig, ax = plt.subplots(figsize=(8, max(2, total*0.3)))
+                ax.barh(df_res["filename"], df_res["prob_dog"].fillna(0))
+                ax.set_xlim(0,1)
+                ax.set_xlabel("Probability (Dog)")
+                st.pyplot(fig)
+
+            # Provide CSV download
+            csv_bytes = df_res.to_csv(index=False).encode("utf-8")
+            st.download_button("Download results (CSV)", data=csv_bytes, file_name="predictions.csv", mime="text/csv")
+
+            # OPTION: allow images + CSV bundle download (zip)
+            if st.checkbox("Download images + CSV as ZIP"):
+                import zipfile, io
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                    # add CSV
+                    zf.writestr("predictions.csv", csv_bytes)
+                    # add each image
+                    for name, pil in imgs_for_pred:
+                        buf = io.BytesIO()
+                        pil.save(buf, format="PNG")
+                        zf.writestr(f"images/{name}.png", buf.getvalue())
+                zip_buffer.seek(0)
+                st.download_button("Download ZIP (images + csv)", data=zip_buffer, file_name="predictions_bundle.zip", mime="application/zip")
+
+# Footer
 st.markdown("---")
-st.markdown("### Cara deploy")
 st.markdown(
     """
-1. Simpan `app.py` dan `requirements.txt` di satu folder.  
-2. Jalankan di lokal:
+**Notes & Tips**  
+- Threshold dapat disesuaikan sesuai trade-off false-positive/false-negative.  
+- Untuk repo privat Hugging Face, simpan token di Secrets (Streamlit) atau environment variable `HF_TOKEN`.  
+- Untuk performa lebih baik saat batch besar, jalankan di server dengan GPU (jika model butuh).
+"""
+)
